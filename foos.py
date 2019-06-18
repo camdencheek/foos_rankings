@@ -66,6 +66,18 @@ class GameTable:
     player_table = PlayerTable(self.c)
     return [ GameTable.game_from_row(row) for row in rows]
 
+  def games_for_player(self, player_id, only_wins=False, only_losses=False):
+    assert(not (only_wins and only_losses))
+    if only_wins:
+      query = f"SELECT winner1, winner2, loser1, loser2, date, id FROM games WHERE winner1 = {player_id} OR winner2 = {player_id}"
+    elif only_losses:
+      query = f"SELECT winner1, winner2, loser1, loser2, date, id FROM games WHERE loser1 = {player_id} OR loser2 = {player_id}"
+    else:
+      query = f"SELECT winner1, winner2, loser1, loser2, date, id FROM games WHERE winner1 = {player_id} OR winner2 = {player_id} OR loser1 = {player_id} OR loser2 = {player_id}"
+
+    rows = self.c.execute(query).fetchall()
+    return [ GameTable.game_from_row(row) for row in rows]
+
   def insert_game(self, game):
     self.c.execute('''INSERT INTO games(winner1, winner2, loser1, loser2, date) VALUES (?, ?, ?, ?, ?)''',
                    (game.winners[0], game.winners[1], game.losers[0], game.losers[1], game.date.isoformat()))
@@ -208,35 +220,49 @@ class Application:
       loser1 = t1p1.id
       loser2 = t1p2.id
 
-    return Game(winner1, winner2, loser1, loser2)
+    double = Application.prompt_yes_no("Was this game a double?", default=False)
 
-  def process_game(self, game):
+    return Game(winner1, winner2, loser1, loser2), double
+
+  def process_game(self, game, double=False):
     rating_table = RatingTable(self.c)
     game_table = GameTable(self.c)
 
-    game = game_table.insert_game(game)
+    inserted_game = game_table.insert_game(game)
     self.conn.commit()
 
-    ratings = rating_table.create_ratings_from_game(game)
+    ratings = rating_table.create_ratings_from_game(inserted_game)
     self.conn.commit()
+
+    if double:
+      inserted_game = game_table.insert_game(game)
+      self.conn.commit()
+
+      ratings = rating_table.create_ratings_from_game(inserted_game)
+      self.conn.commit()
+
     return ratings
 
   def summarize_rankings(self):
     rating_table = RatingTable(self.c)
     player_table = PlayerTable(self.c)
+    game_table = GameTable(self.c)
 
     latest_ratings = rating_table.latest_ratings()
     latest_ratings.sort(key=lambda x: -x.mu)
     print("\n\n==== RATINGS ====")
     for i, rating in enumerate(latest_ratings):
       name = player_table.get_player(rating.player_id).name.title()
-      print(f"{i+1}. {name:20} {rating.mu:0.2f} (±{rating.sigma:0.2f})")
+      wins = game_table.games_for_player(rating.player_id, only_wins = True)
+      losses = game_table.games_for_player(rating.player_id, only_losses = True)
+      win_pct = float(len(wins)) / (float(len(wins)) + float(len(losses))) * 100.0
+      print(f"{i+1}. {name:20} {rating.mu:0.2f} (±{rating.sigma:0.2f}) {win_pct:0.2f}% Win Rate")
 
   @staticmethod
-  def prompt_yes_no(prompt):
-    chars = {'y': True, 'Y': True, 'N': False, 'n': False, '\n': True}
+  def prompt_yes_no(prompt, default=True):
+    chars = {'y': True, 'Y': True, 'N': False, 'n': False, '\n': default}
     while True:
-      sys.stdout.write(f"{prompt} [Y/n] ")
+      sys.stdout.write(f"{prompt} [{'Y/n' if default else 'y/N'}] ")
       sys.stdout.flush()
       char = getch.getche()
       result = chars.get(char, None)
@@ -272,6 +298,8 @@ class Application:
       sys.stdout.write("Which team won (1 or 2)? ")
       sys.stdout.flush()
       winning_team = getch.getche()
+      sys.stdout.write("\n")
+      sys.stdout.flush()
       if winning_team == "1":
         return 1
       elif winning_team == "2":
@@ -280,9 +308,11 @@ class Application:
         print("Please enter 1 or 2.")
 
 
+
+
 if __name__ == '__main__':
   app = Application('ratings.db')
-  game = app.request_game_info()
-  app.process_game(game)
+  game, double = app.request_game_info()
+  app.process_game(game, double)
   app.summarize_rankings()
 

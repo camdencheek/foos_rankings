@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 from trueskill import Rating, rate
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import datetime
 import dateutil.parser
 import getch
@@ -17,16 +18,18 @@ class PlayerTable:
     return Player(row['name'], row['id'])
 
   def players(self):
-    rows = self.c.execute('''SELECT * FROM players;''').fetchall()
+    self.c.execute('''SELECT * FROM players;''')
+    rows = self.c.fetchall()
     return [PlayerTable.player_from_row(row) for row in rows]
 
   def insert_player(self, player):
-    self.c.execute('''INSERT INTO players(name) VALUES (?)''', (player.name.lower(),))
-    player.id = self.c.lastrowid
+    self.c.execute('''INSERT INTO players(name) VALUES (%s) RETURNING id''', (player.name.lower(),))
+    row = self.c.fetchone()
+    player.id = row['id']
     return player
 
   def get_player(self, player_id):
-    self.c.execute('''SELECT * FROM players WHERE id = ?''', (player_id,))
+    self.c.execute('''SELECT * FROM players WHERE id = %s''', (player_id,))
     row = self.c.fetchone()
     if row is None:
       return None
@@ -34,7 +37,8 @@ class PlayerTable:
       return PlayerTable.player_from_row(row)
 
   def search_name_prefix(self, name):
-    rows = self.c.execute('''SELECT * FROM players WHERE name LIKE ?''', (f"{name}%",))
+    self.c.execute('''SELECT * FROM players WHERE name ILIKE %s''', (f"{name}%",))
+    rows = self.c.fetchall()
     return [PlayerTable.player_from_row(row) for row in rows]
 
 
@@ -62,7 +66,8 @@ class GameTable:
     )
 
   def games(self):
-    rows = self.c.execute('''SELECT winner1, winner2, loser1, loser2, date, id FROM games''').fetchall()
+    self.c.execute('''SELECT winner1, winner2, loser1, loser2, date, id FROM games''')
+    rows = self.c.fetchall()
     player_table = PlayerTable(self.c)
     return [ GameTable.game_from_row(row) for row in rows]
 
@@ -75,17 +80,19 @@ class GameTable:
     else:
       query = f"SELECT winner1, winner2, loser1, loser2, date, id FROM games WHERE winner1 = {player_id} OR winner2 = {player_id} OR loser1 = {player_id} OR loser2 = {player_id}"
 
-    rows = self.c.execute(query).fetchall()
+    self.c.execute(query)
+    rows = self.c.fetchall()
     return [ GameTable.game_from_row(row) for row in rows]
 
   def insert_game(self, game):
-    self.c.execute('''INSERT INTO games(winner1, winner2, loser1, loser2, date) VALUES (?, ?, ?, ?, ?)''',
+    self.c.execute('''INSERT INTO games(winner1, winner2, loser1, loser2, date) VALUES (%s, %s, %s, %s, %s) RETURNING id''',
                    (game.winners[0], game.winners[1], game.losers[0], game.losers[1], game.date.isoformat()))
-    game.id = self.c.lastrowid
+    game.id = self.c.fetchone()['id']
     return game
 
   def get_game(self, game_id):
-    rows = self.c.execute('''SELECT * FROM games WHERE id = ? LIMIT 1''', (game_id,))
+    self.c.execute('''SELECT * FROM games WHERE id = %s LIMIT 1''', (game_id,))
+    row = self.c.fetchone()
     return GameTable.game_from_row(row)
 
 
@@ -116,17 +123,19 @@ class RatingTable:
     )
 
   def ratings(self):
-    rows = self.c.execute('''SELECT player_id, mu, sigma, id, game_id FROM ratings;''').fetchall()
+    self.c.execute('''SELECT player_id, mu, sigma, id, game_id FROM ratings;''')
+    rows = self.c.fetchall()
     return [RatingTable.rating_from_row(row) for row in rows]
 
   def insert_rating(self, game_id, rating):
-    self.c.execute('''INSERT INTO ratings(game_id, player_id, mu, sigma) VALUES (?,?,?,?)''',
+    self.c.execute('''INSERT INTO ratings(game_id, player_id, mu, sigma) VALUES (%s,%s,%s,%s) RETURNING id''',
                    (game_id, rating.player_id, rating.mu, rating.sigma))
-    rating.id = self.c.lastrowid
+    rating.id = self.c.fetchone()['id']
     return rating
 
   def player_rating(self, player_id):
-    row = self.c.execute('''SELECT player_id, mu, sigma, id, game_id FROM ratings WHERE player_id=? ORDER BY id DESC LIMIT 1''', (player_id,)).fetchone()
+    self.c.execute('''SELECT player_id, mu, sigma, id, game_id FROM ratings WHERE player_id=%s ORDER BY id DESC LIMIT 1''', (player_id,))
+    row = self.c.fetchone()
     if row is None:
       return Rating(player_id, 500, 200)
     else:
@@ -159,7 +168,8 @@ class RatingTable:
         GROUP BY player_id
       );
     '''
-    rows = self.c.execute(query)
+    self.c.execute(query)
+    rows = self.c.fetchall()
     return [RatingTable.rating_from_row(row) for row in rows]
 
 
@@ -176,28 +186,27 @@ class Rating:
     return ','.join(map(str, [self.id, self.game_id, self.player_id, self.mu, self.sigma]))
 
 class Application:
-  def __init__(self, database_file):
-    conn = sqlite3.connect('rankings.db')
-    conn.row_factory = Application.dict_factory
+  def __init__(self):
+    password = open('creds', 'r').read().strip()
+    conn = psycopg2.connect(
+      host="aws-postgres.c5rfqgspm32h.us-east-1.rds.amazonaws.com",
+      user="ccheek",
+      password=password,
+      database='foosball',
+      sslmode='disable'
+    )
     self.conn = conn
-    self.c = self.conn.cursor()
+    self.c = self.conn.cursor(cursor_factory=RealDictCursor)
     self.create_tables()
 
   def __del__(self):
     self.conn.commit()
     self.conn.close()
 
-  @staticmethod
-  def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-      d[col[0]] = row[idx]
-    return d
-
   def create_tables(self):
-    self.c.execute('''CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);''')
-    self.c.execute('''CREATE TABLE IF NOT EXISTS games (id INTEGER PRIMARY KEY AUTOINCREMENT, winner1 INTEGER, winner2 INTEGER, loser1 INTEGER, loser2 INTEGER, date TEXT);''')
-    self.c.execute('''CREATE TABLE IF NOT EXISTS ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, game_id INTEGER, player_id INTEGER, mu REAL, sigma REAL);''')
+    self.c.execute('''CREATE TABLE IF NOT EXISTS players (id SERIAL PRIMARY KEY, name TEXT);''')
+    self.c.execute('''CREATE TABLE IF NOT EXISTS games (id SERIAL PRIMARY KEY, winner1 INTEGER, winner2 INTEGER, loser1 INTEGER, loser2 INTEGER, date TEXT);''')
+    self.c.execute('''CREATE TABLE IF NOT EXISTS ratings (id SERIAL PRIMARY KEY, game_id INTEGER, player_id INTEGER, mu REAL, sigma REAL);''')
 
   def request_game_info(self):
     player_table = PlayerTable(self.c)
@@ -311,7 +320,7 @@ class Application:
 
 
 if __name__ == '__main__':
-  app = Application('ratings.db')
+  app = Application()
   game, double = app.request_game_info()
   app.process_game(game, double)
   app.summarize_rankings()
